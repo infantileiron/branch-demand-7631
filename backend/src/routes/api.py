@@ -2,13 +2,15 @@ import os,json
 import redis
 from fastapi import APIRouter,Depends,HTTPException,Response
 from src.config.database import db
-from src.models.entities import User,DailyVolume,ForecastRun,Staffing,Audit
+from src.models.entities import User,DailyVolume,ForecastRun,Staffing,Audit,Publication,BudgetDay
 from src.schemas.business import Login,DailyInput,ForecastInput,StaffingInput
+from src.schemas.publications import PublicationInput
 from src.middlewares.auth import current,editor,admin
 from src.utils.security import verify,token
 from src.services.business import audit,dump
 from src.services.volumes import save_volume
 from src.services.staffing import draft
+from src.services import publications as pubs
 from src.controllers.business import ensure_run
 router=APIRouter()
 @router.post('/auth/login')
@@ -53,5 +55,40 @@ def approve(i:int,u=Depends(admin),s=Depends(db)):
  if not r:raise HTTPException(404,'排班建议不存在')
  if r.status!='draft':raise HTTPException(409,'不可重复签核')
  r.status='approved';s.commit();audit(s,u,'签核排班 '+str(i));return dump(r)
+def _publication(s,number,status=404):
+ pub=s.query(Publication).filter_by(number=number).first()
+ if not pub:raise HTTPException(status,'发布记录不存在')
+ return pub
+@router.post('/publications')
+def publish(data:PublicationInput,u=Depends(editor),s=Depends(db)):
+ pub,queued=pubs.create(s,data,u.email)
+ body=pubs.public_view(pub);body['queued']=queued
+ if not queued:body['note']='队列暂不可用，记录保持待处理，worker恢复后继续'
+ return body
+@router.get('/publications')
+def publications(u=Depends(current),s=Depends(db)):
+ view=pubs.public_view if u.role=='viewer' else pubs.internal_view
+ return [view(p) for p in s.query(Publication).order_by(Publication.id.desc()).all()]
+@router.get('/publications/{number}')
+def publication(number:str,u=Depends(current),s=Depends(db)):
+ return pubs.public_view(_publication(s,number)) if u.role=='viewer' else pubs.internal_view(_publication(s,number))
+@router.post('/publications/{number}/withdraw')
+def withdraw(number:str,u=Depends(editor),s=Depends(db)):
+ return pubs.internal_view(pubs.withdraw(s,number,u.email))
+@router.get('/publications/{number}/claim')
+def claim(number:str,u=Depends(current),s=Depends(db)):
+ pub=_publication(s,number)
+ if pub.state!='claimable':raise HTTPException(409,'发布尚不可领取')
+ if u.role!='viewer':audit(s,u,'领取对外发布 '+number)
+ return pubs.public_view(pub)
+@router.get('/publications/{number}/export')
+def claim_export(number:str,u=Depends(current),s=Depends(db)):
+ pub=_publication(s,number)
+ if pub.state!='claimable':raise HTTPException(409,'仅可领取的发布可导出')
+ return Response(json.dumps(pubs.public_view(pub),ensure_ascii=False,indent=2),media_type='application/json',headers={'Content-Disposition':f'attachment; filename="publication-{number}.json"'})
+@router.get('/budget')
+def budget(branch:str,u=Depends(admin),s=Depends(db)):
+ rows=s.query(BudgetDay).filter_by(branch=branch).order_by(BudgetDay.day).all()
+ return [{'branch':r.branch,'day':r.day,'used':r.used_micro/1_000_000} for r in rows]
 @router.get('/audits')
 def audits(u=Depends(admin),s=Depends(db)):return [dump(r) for r in s.query(Audit).order_by(Audit.id.desc()).limit(100)]

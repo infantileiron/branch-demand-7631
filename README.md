@@ -6,7 +6,7 @@
 
 栖川售后每天由8位网点值班员汇总工单到达量，排班组在 `栖川_网点日结_20261114.xlsx` 中复制上周星期分布，再手工加减人数。痛点：漏日常被当零量、趋势调整没有回测、排班人数和依据版本难追溯。上游是售后工单日结；本项目替代连续性核对、预测比较与人数换算；下游是网点负责人核对技能、休息和班次后安排人员。
 
-四个模块：日量导入（逐条表单/API，含修订）、回测设置、预测对比、排班建议。三个核心实体为DailyVolume、ForecastRun、Staffing，分别贯穿数据库、模式、业务服务/控制、路由和前端；另有用户与审计。提交任务时冻结原始记录与参数，之后补录不改变旧预测。
+五个模块：日量导入（逐条表单/API，含修订）、回测设置、预测对比、排班建议、对外发布。核心实体为DailyVolume、ForecastRun、Staffing、Publication，并有BudgetDay/BudgetEntry逐日预算台账；分别贯穿数据库、模式、业务服务/控制、路由和前端；另有用户与审计。提交任务时冻结原始记录与参数，之后补录不改变旧预测。
 
 |角色|可访问|典型动作|
 |---|---|---|
@@ -46,6 +46,18 @@ docker compose exec -T backend python -m scripts.seed_demo
 
 回测预测先截负为0；未来预测同样截断，再用floor(raw+0.5)四舍五入成非负整数，保留raw及clipped标记。最后用全部历史拟合两个未来7日序列。结果保存冻结记录、参数、checksum、回测逐日明细与两组未来预测。排班人数=`ceil(预测单量/单人日容量)`；容量需1–1000，由业务输入。不处理技能、休息、缺勤、轮班组合优化；不自动替代现场排班决定。
 
+## 对外共享预测（纯差分隐私）
+
+内部预测照旧保留在「预测对比」与「排班建议」；「对外发布」只输出扰动后的两法七日整数预测与机制说明，**不带出网点日结原值、回测真值和随机种子**。
+
+**机制**：发布由后台从提交时冻结的日量快照重算两法原始预测（补录不会改变），日量按预设上限裁剪后加噪（默认200，`DEFAULT_CLIP_UPPER`；每次发布可在1–1000内显式指定，界随之上/下可核验）。未来7步是输入的线性函数：周季节朴素逐日复制最近7日（L1系数1），Holt按`l'=(1−α)(l+b)`、`b'=β(l'−l)+(1−β)b`线性递推，用闭式系数精确求出每个输入位置的逐日L1系数。整组14维的**向量值Laplace机制**：每个模型对7维整体加一次Laplace(0, Δ/ε_model)，Δ=裁剪上限×该模型逐日L1系数最大值；两模型串行组合ε1+ε2=ε，故14个整数是纯ε-DP（δ=0），不是每维各花ε。四舍五入与截零是后处理，不改变界。
+
+**可核验**：机制说明列出`clip_upper`、两模型`l1_sensitivity`、`output_sensitivity`、`noise_scale`、`epsilon_per_model`、`epsilon_total`、`delta=0`与邻接定义；灵敏度只依赖上限、窗口长度与α/β，可离线复算。默认α=.6/β=.2、70日窗口时Holt灵敏度7.56、Δ=1512，噪声尺度约3024/ε。
+
+**预算**：每次发布声明ε（0.01–10）、逐日累计上限cap（≤50）与裁剪上限（默认200），以micro-ε整数记账。发布覆盖快照内每个训练日期，**重叠训练日共同扣账**（每遇一个就加整份ε）；扣账是条件自增`used+ε≤cap`，按日期排序在单事务内执行，**并发不超支**，任一日期不足则整笔拒绝且不扣账。**撤回不退还**已领取预算，明细保留。
+
+**幂等与恢复**：`number`为幂等号，同号同内容复用原记录、不重复扣账；同号异内容409；已撤回不可重投。发布状态`pending`→`claimable`（另可`withdrawn`/`failed`）。种子只存服务端，噪声由种子+坐标哈希确定，**中断后续算逐位一致**；入队失败时记录保持待处理，worker启动恢复，最多3次尝试。
+
 ## 工程结构与环境
 
 |部分|技术|
@@ -56,14 +68,14 @@ docker compose exec -T backend python -m scripts.seed_demo
 
 `frontend/src`按api、stores、types、components/common、hooks、pages、router、utils、constants分工；backend/src按routes、controllers、services、models、schemas、middlewares、utils、constants、config分工。表格/字段/状态标签在多页共用；表单hooks和HTML转义工具分离。请求ID、安全响应头两个中间件，写操作审计、全局异常恢复提示。JWT默认有效8小时。
 
-恰好五服务：backend等待db/redis健康，worker还等待backend，frontend等待backend。所有服务有healthcheck；worker每轮更新`/tmp/heartbeat`，Redis队列处理真实预测并在`/artifacts`共享卷写JSON。数据库、Redis、结果各有命名卷。Nginx `/api/`转发后端根路由；worker启动恢复queued/running任务。清理：`docker compose down -v --remove-orphans`。
+恰好五服务：backend等待db/redis健康，worker还等待backend，frontend等待backend。所有服务有healthcheck；worker每轮更新`/tmp/heartbeat`，Redis队列处理真实预测与对外发布并在`/artifacts`共享卷写JSON；`demand:runs`与`demand:publications`两个队列。数据库、Redis、结果各有命名卷。Nginx `/api/`转发后端根路由；worker启动恢复queued/running预测与待处理发布。清理：`docker compose down -v --remove-orphans`。
 
 环境变量见.env.example：COMPOSE_PROJECT_NAME、FRONTEND_PORT、BACKEND_PORT、DB_PORT、DB_PASSWORD、JWT_SECRET、SEED_DEMO、NETWORK_SUBNET。显式10.253.109.0/24用于规避当前机默认网络池耗尽，移机可调整。演示凭据/JWT密钥部署时替换。本地开发可先起db/redis，在backend安装requirements，设置DATABASE_URL/REDIS_URL/JWT_SECRET，再`uvicorn src.main:app --reload`；前端沿用Nginx或同源代理。ORM建初表，migrations保留DDL，无在线版本迁移器。
 
-共享枚举：ROLES、STATES、BRANCHES、MODELS，后端src/constants/enums.py和schemas/business.py，前端src/constants/enums.js；存储列见models/entities.py。所有计算和人数换算在后端，前端只展示。
+共享枚举：ROLES、STATES、BRANCHES、MODELS，后端src/constants/enums.py和schemas/business.py，前端src/constants/enums.js；差分隐私常量与发布状态在src/constants/privacy.py，机制实现在src/services/privacy.py，编排在src/services/publications.py；存储列见models/entities.py。所有计算和人数换算在后端，前端只展示。
 
 ## 范围与证据
 
 小型演示为逐条录入/修订，无CSV批量上传、删除、分页、自动超参搜索或外部排班发布。无置信区间或节假日外生变量；单worker，不宣称多worker exactly-once。时间序列按业务日，不涉及小时时区换算。字体依赖Google Fonts，断网回退serif/sans-serif。
 
-真实测试、截图和已知差异放在 `../../test-artifacts/gb-3109/`，源码不放证据。测试包含算法已知值、零MAPE、缺日拒绝、无未来泄漏、种子幂等、三角色与浏览器完整流程。许可证MIT，见LICENSE。
+真实测试、截图和已知差异放在 `../../test-artifacts/gb-3109/`，源码不放证据。测试包含算法已知值、零MAPE、缺日拒绝、无未来泄漏、种子幂等、三角色与浏览器完整流程；本仓库另有`tests/`覆盖差分隐私（Holt系数与模拟对照、裁剪邻接的灵敏度界、噪声尺度）、发布（幂等、重叠扣账、预算不足整笔拒绝、中断重跑一致、撤回不退、不可泄露字段）与API（角色、状态流转、领取/导出不含种子）。并发末笔预算测试需真实PostgreSQL：`TEST_DATABASE_URL=postgresql+psycopg://... pytest`，SQLite默认跳过该项。许可证MIT，见LICENSE。

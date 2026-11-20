@@ -296,3 +296,54 @@ ALTER TABLE ONLY public.staffings
 
 \unrestrict lXFB6fNpI4rXcksEIua5wCwsTi9dYlOU8AAtbpjjkZcdJKYCuoHM9Ug1Wwit1mc
 
+
+--
+-- 对外发布与逐日预算台账（差分隐私）
+--
+
+CREATE TABLE public.publications (
+    id integer NOT NULL,
+    number character varying(64) NOT NULL,
+    name character varying(100),
+    branch character varying(30) NOT NULL,
+    run_id integer NOT NULL,
+    epsilon_micro integer NOT NULL,
+    daily_cap_micro integer NOT NULL,
+    clip_upper integer NOT NULL,
+    request_hash character varying(64) NOT NULL,
+    state character varying(20),
+    result json,
+    mechanism json,
+    error text,
+    attempts integer,
+    seed character varying(64) NOT NULL,
+    created character varying(40),
+    updated character varying(40)
+);
+CREATE SEQUENCE public.publications_id_seq AS integer START WITH 1 INCREMENT BY 1 NO MINVALUE NO MAXVALUE CACHE 1;
+ALTER SEQUENCE public.publications_id_seq OWNED BY public.publications.id;
+ALTER TABLE ONLY public.publications ALTER COLUMN id SET DEFAULT nextval('public.publications_id_seq'::regclass);
+ALTER TABLE ONLY public.publications ADD CONSTRAINT publications_pkey PRIMARY KEY (id);
+ALTER TABLE ONLY public.publications ADD CONSTRAINT publications_number_key UNIQUE (number);
+ALTER TABLE ONLY public.publications ADD CONSTRAINT publications_run_id_fkey FOREIGN KEY (run_id) REFERENCES public.forecast_runs(id);
+
+CREATE TABLE public.budget_days (
+    branch character varying(30) NOT NULL,
+    day character varying(10) NOT NULL,
+    used_micro integer NOT NULL
+);
+ALTER TABLE ONLY public.budget_days ADD CONSTRAINT pk_budget_day PRIMARY KEY (branch, day);
+
+CREATE TABLE public.budget_entries (
+    id integer NOT NULL,
+    number character varying(64) NOT NULL,
+    branch character varying(30) NOT NULL,
+    day character varying(10) NOT NULL,
+    epsilon_micro integer NOT NULL,
+    created character varying(40)
+);
+CREATE SEQUENCE public.budget_entries_id_seq AS integer START WITH 1 INCREMENT BY 1 NO MINVALUE NO MAXVALUE CACHE 1;
+ALTER SEQUENCE public.budget_entries_id_seq OWNED BY public.budget_entries.id;
+ALTER TABLE ONLY public.budget_entries ALTER COLUMN id SET DEFAULT nextval('public.budget_entries_id_seq'::regclass);
+ALTER TABLE ONLY public.budget_entries ADD CONSTRAINT budget_entries_pkey PRIMARY KEY (id);
+ALTER TABLE ONLY public.budget_entries ADD CONSTRAINT uq_budget_entry UNIQUE (number, branch, day);
